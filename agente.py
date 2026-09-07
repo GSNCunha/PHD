@@ -137,9 +137,10 @@ def fetch_jobs_from_rss() -> list:
     return jobs
 
 # --- 4. TELEGRAM ALERT ---
-def send_telegram_alert(message: str):
+def send_telegram_alert(message: str) -> bool:
+    """Retorna True se a mensagem foi enviada com sucesso, False caso contrário."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -149,10 +150,14 @@ def send_telegram_alert(message: str):
     }
     try:
         response = requests.post(url, json=payload, timeout=10)
-        if response.status_code != 200:
+        if response.status_code == 200:
+            return True
+        else:
             print(f"❌ Telegram Error: {response.text}")
+            return False
     except Exception as e:
         print(f"❌ Telegram connection error: {e}")
+        return False
 
 # --- 5. AI EVALUATION ---
 def evaluate_job_with_ai(title: str, description: str, link: str = "") -> dict:
@@ -163,23 +168,32 @@ def evaluate_job_with_ai(title: str, description: str, link: str = "") -> dict:
     prompt = f"""
     You are an expert scientific and academic recruiter in Europe.
     Analyze the PhD position below and verify its alignment with the researcher's profile.
+    Extract the application deadline if present.
+    
+    CRITICAL INSTRUCTION: First, determine if the provided text is an ACTUAL, OPEN PhD position. 
+    If it is a generic professor's profile, a news article, a past event, or a position with a closed deadline, it is NOT an open position.
+    
     --- CANDIDATE PROFILE ---
     {RESEARCHER_PROFILE}
+    
     --- JOB DATA ---
     Title: {title}
     Description: {description}
     Link: {link}
+    
     --- RESPONSE RULES ---
-    Return STRICTLY a valid JSON object. Do not include markdown code blocks (like ```json). Just the raw JSON.
+    Return STRICTLY a valid JSON object. Do not include markdown code blocks. Just the raw JSON.
     Format:
     {{
+        "is_open_position": <true if it is clearly an active, open PhD call/vacancy, false otherwise>,
         "score_match": <integer from 0 to 100>,
-        "country": "<Country of position the>",
-        "institution": "<Name Institute Lab, University, of or the>",
-        "funded": "<Yes / No Unspecified>",
-        "project_summary": "<Clear 2-sentence and of project summary technologies the>",
-        "match_reason": "<Brief does explanation fit fits it keywords not of or profile the why>",
-        "recommend": <true if score_match >= 70 and funded != "No", otherwise false>
+        "country": "<Country of the position>",
+        "institution": "<Name of the University, Lab, or Institute>",
+        "funded": "<Yes / No / Unspecified>",
+        "deadline": "<Application deadline or 'Not specified'>",
+        "project_summary": "<Clear 2-sentence summary of the project and technologies>",
+        "match_reason": "<Brief explanation of why it fits or does not fit the profile keywords>",
+        "recommend": <true if score_match >= 70 and funded != "No" and is_open_position == true, otherwise false>
     }}
     """
     for attempt in range(3):
@@ -198,25 +212,33 @@ def evaluate_job_with_ai(title: str, description: str, link: str = "") -> dict:
                 return None
                 
         except Exception as e:
-            print(f"❌ Erro na avaliação da IA: {e}")
-            if "503" in str(e) and attempt < 2:
+            error_str = str(e)
+            if "429" in error_str:
+                print(f"⏳ Cota excedida (Rate Limit). Pausando por 30 segundos...")
+                time.sleep(30)
+            elif "503" in error_str and attempt < 2:
                 time.sleep((attempt + 1) * 3)
             else:
+                print(f"❌ Erro na avaliação da IA: {e}")
                 return None
     return None
 
 # --- 6. MAIN PROCESSING PIPELINE ---
 def process_jobs(job_list: list):
     seen_jobs = load_seen_jobs()
+    
+    # Filtra apenas vagas que ainda não constam no histórico
+    unseen_jobs = [job for job in job_list if job.get("link") and job.get("link") not in seen_jobs]
+    
+    # LIMITADOR: Garante que apenas 20 requisições sejam feitas por execução
+    max_evaluations = 20
+    jobs_to_evaluate = unseen_jobs[:max_evaluations]
+    
     new_jobs_count = 0
-    print(f"🔍 Found {len(job_list)} job(s) in total. Processing new ones...")
+    print(f"🔍 Found {len(job_list)} total jobs. {len(unseen_jobs)} new ones. Processing top {len(jobs_to_evaluate)}...")
 
-    for job in job_list:
+    for job in jobs_to_evaluate:
         link = job.get("link", "")
-        if link in seen_jobs or not link:
-            continue
-
-        new_jobs_count += 1
         print(f"\n--- Analyzing: {job.get('title')} ---")
         
         evaluation = evaluate_job_with_ai(
@@ -225,10 +247,11 @@ def process_jobs(job_list: list):
             link=link
         )
         
-        seen_jobs.add(link)
+        # Pausa mandatória para evitar o erro 429 e 503 do Gemini
+        time.sleep(4)
         
         if not evaluation:
-            print("⚠️ Avaliação ignorada (Falha na IA).")
+            print("⚠️ Avaliação ignorada (Falha na IA). A vaga não será salva no histórico e tentaremos de novo depois.")
             continue
 
         score = evaluation.get("score_match", 0)
@@ -245,23 +268,33 @@ def process_jobs(job_list: list):
                 f"🏛️ *Institution:* {evaluation.get('institution', 'Unknown')}\n"
                 f"🌍 *Country:* {evaluation.get('country', 'Europe')}\n"
                 f"💰 *Funded:* {evaluation.get('funded', 'N/A')}\n"
+                f"📅 *Deadline:* {evaluation.get('deadline', 'Not specified')}\n"
                 f"📊 *Match Score:* {score}%\n\n"
                 f"📝 *Summary:* {evaluation.get('project_summary')}\n\n"
                 f"💡 *Why:* {evaluation.get('match_reason')}\n\n"
                 f"🔗 [Apply / View Position]({link})"
             )
-            send_telegram_alert(message)
+            
+            # Condição de envio: Se enviar com sucesso, salva. Se não, deixa para tentar novamente.
+            if send_telegram_alert(message):
+                seen_jobs.add(link)
+                new_jobs_count += 1
+                print("📲 Alerta enviado com sucesso e salvo no histórico!")
+            else:
+                print("❌ Falha no Telegram. A vaga não foi adicionada ao histórico.")
+        else:
+            # Salva no histórico vagas ruins para não gastar API do Gemini novamente amanhã lendo lixo
+            seen_jobs.add(link)
+            print("ℹ️ Vaga fora do perfil. Salva no histórico para ser descartada nas próximas buscas.")
 
+    # Salva todas as alterações no arquivo json no final da execução
     save_seen_jobs(seen_jobs)
-    print(f"\n✅ Pipeline Finished. {new_jobs_count} new jobs analyzed.")
+    print(f"\n✅ Pipeline Finished. {new_jobs_count} new alerts successfully sent.")
 
 # --- 7. EXECUTION ---
 if __name__ == "__main__":
     print("🚀 Starting PhD Agent Pipeline...")
     all_jobs = []
-    
-    # Para testes rápidos e não torrar a cota do Serper atoa caso queira depurar apenas a IA:
-    # você pode deletar o arquivo seen_jobs.json antes de rodar.
     
     all_jobs.extend(fetch_jobs_from_serper(ALPINE_DOMAINS, "Alpine Domains"))
     all_jobs.extend(fetch_jobs_from_serper(GENERAL_DOMAINS, "General European Portals"))
