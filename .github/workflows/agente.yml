@@ -1,0 +1,40 @@
+name: Agente de Vagas PhD
+
+on:
+  schedule:
+    - cron: '0 8 * * *'  # Rodar todos os dias às 08:00 UTC
+  workflow_dispatch:      # Permite rodar manualmente pelo painel do GitHub
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Permissão crucial para o bot poder salvar o JSON no repositório
+
+    steps:
+      - name: Clonar Repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Instalar Dependências
+        run: pip install -r requirements.txt
+
+      - name: Executar Agente
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_SEARCH_API_KEY: ${{ secrets.GOOGLE_SEARCH_API_KEY }}
+          GOOGLE_SEARCH_CX: ${{ secrets.GOOGLE_SEARCH_CX }}
+        run: python agente.py
+
+      - name: Salvar histórico de vagas lidas
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_jobs.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: atualiza histórico de vagas" && git push)
