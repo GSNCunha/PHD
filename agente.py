@@ -3,20 +3,19 @@ import json
 import time
 import requests
 import feedparser
+import re
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from google import genai
 
-# Load environment variables
+# Load environment variables (override=True garante a leitura do .env atual)
 load_dotenv(override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
-GOOGLE_SEARCH_CX = os.getenv("GOOGLE_SEARCH_CX")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 HISTORY_FILE = "seen_jobs.json"
-print(f"🛠️ DEBUG: A chave enviada ao Google termina em: ...{GOOGLE_SEARCH_API_KEY[-4:]}")
 
 # Initialize Gemini Client
 client = None
@@ -29,17 +28,13 @@ KEYWORDS_TOPICS = [
     "control systems", "AI for robots", "SLAM", "ROS 2", "C++"
 ]
 
-KEYWORDS_POSITIONS = [
-    "PhD", "Doctoral Candidate", "Research Assistant"
-]
-
 RESEARCHER_PROFILE = f"""
 Core Interests: {', '.join(KEYWORDS_TOPICS)}
 Focus: Mobile robotics, autonomous navigation, SLAM/FastSLAM, control engineering, embedded systems, and AI.
 Application Requirements: Fully Funded PhD Candidate / Research Assistant in Europe.
 """
 
-# Alpine universities domains for prioritizing the Telegram alert
+# Alpine universities domains
 ALPINE_DOMAINS = [
     "unibz.it", "polito.it", "polimi.it", "unipd.it", "unibg.it",
     "unibs.it", "uniud.it", "unige.it", "univr.it", "units.it",
@@ -50,7 +45,11 @@ ALPINE_DOMAINS = [
     "tum.de", "hs-kempten.de", "th-rosenheim.de", "hm.edu", "uni-stuttgart.de"
 ]
 
-# RSS Feeds as backup
+GENERAL_DOMAINS = [
+    "euraxess.ec.europa.eu", "inria.fr", "abg.asso.fr", 
+    "campusfrance.org", "robotics-worldwide.org"
+]
+
 RSS_FEEDS = [
     "https://academicpositions.com/jobs/robotics/rss",
     "https://academicpositions.com/jobs/engineering/rss"
@@ -58,7 +57,6 @@ RSS_FEEDS = [
 
 # --- 2. MEMORY MANAGEMENT ---
 def load_seen_jobs() -> set:
-    """Loads previously analyzed URLs to prevent duplicates."""
     if os.path.exists(HISTORY_FILE):
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
             try:
@@ -68,68 +66,59 @@ def load_seen_jobs() -> set:
     return set()
 
 def save_seen_jobs(seen_jobs: set):
-    """Saves analyzed URLs to the JSON file."""
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(list(seen_jobs), f, indent=2)
 
 # --- 3. FETCHING DATA ---
-def fetch_jobs_from_google() -> list:
-    """Uses Google Custom Search API to query predefined Alpine and European domains."""
+def fetch_jobs_from_serper(domain_list: list, source_name: str) -> list:
     jobs = []
-    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_CX:
-        print("⚠️ Google Search credentials missing. Skipping search.")
+    if not SERPER_API_KEY:
+        print(f"⚠️ Serper API Key missing. Skipping {source_name} search.")
         return jobs
 
-    print("🔎 Fetching jobs from Google Custom Search...")
+    print(f"🔎 Fetching jobs via Serper.dev ({source_name})...")
+    batch_size = 10 
     
-    # Focused queries. The domains are already restricted in the Google CSE control panel.
-    queries = [
+    base_queries = [
         '"PhD" ("robotics" OR "SLAM" OR "FastSLAM")',
-        '"PhD" ("autonomous navigation" OR "mobile robots")',
-        '"Doctoral" ("control systems" OR "robotics")'
+        '"PhD" ("autonomous navigation" OR "control systems")'
     ]
+
+    url = "https://google.serper.dev/search"
+    headers = {
+        'X-API-KEY': SERPER_API_KEY,
+        'Content-Type': 'application/json'
+    }
     
-    url = "https://www.googleapis.com/customsearch/v1"
-
-    for query in queries:
-        params = {
-            "key": GOOGLE_SEARCH_API_KEY,
-            "cx": GOOGLE_SEARCH_CX,
-            "q": query,
-            "dateRestrict": "d60", # Expanded to 60 days to catch recent postings
-            "num": 10
-        }
-        
-        try:
-            response = requests.get(url, params=params, timeout=15)
-            data = response.json()
+    for base_query in base_queries:
+        for i in range(0, len(domain_list), batch_size):
+            batch = domain_list[i:i + batch_size]
+            site_filters = " OR ".join([f"site:{domain}" for domain in batch])
+            full_query = f'{base_query} ({site_filters})'
             
-            if "error" in data:
-                print(f"❌ Google API Error: {data['error'].get('message')}")
-                continue
-
-            items = data.get("items", [])
-            print(f"   ↳ Query '{query[:30]}...': found {len(items)} result(s)")
+            payload = json.dumps({
+                "q": full_query,
+                "tbs": "qdr:d60", 
+                "num": 10
+            })
             
-            for item in items:
-                link = item.get("link", "")
+            try:
+                response = requests.post(url, headers=headers, data=payload, timeout=15)
+                data = response.json()
                 
-                # Check if it's an Alpine domain to tag it correctly for the priority alert
-                is_alpine = any(domain in link for domain in ALPINE_DOMAINS)
+                for item in data.get("organic", []):
+                    jobs.append({
+                        "title": item.get("title", ""),
+                        "description": item.get("snippet", ""),
+                        "link": item.get("link", ""),
+                        "source": source_name
+                    })
+            except Exception as e:
+                print(f"❌ Serper API Error: {e}")
                 
-                jobs.append({
-                    "title": item.get("title", ""),
-                    "description": item.get("snippet", ""),
-                    "link": link,
-                    "source": "Alpine Domains" if is_alpine else "General European Portals"
-                })
-        except Exception as e:
-            print(f"❌ Google Search Exception: {e}")
-            
     return jobs
 
 def fetch_jobs_from_rss() -> list:
-    """Fetches job listings from defined RSS feeds."""
     jobs = []
     print("📡 Fetching jobs from RSS feeds...")
     for feed_url in RSS_FEEDS:
@@ -149,10 +138,8 @@ def fetch_jobs_from_rss() -> list:
 
 # --- 4. TELEGRAM ALERT ---
 def send_telegram_alert(message: str):
-    """Sends a Markdown formatted message to the Telegram bot."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
-
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -160,57 +147,58 @@ def send_telegram_alert(message: str):
         "parse_mode": "Markdown",
         "disable_web_page_preview": True
     }
-    
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"❌ Telegram Error: {response.text}")
     except Exception as e:
         print(f"❌ Telegram connection error: {e}")
 
 # --- 5. AI EVALUATION ---
 def evaluate_job_with_ai(title: str, description: str, link: str = "") -> dict:
-    """Analyzes the job using Gemini AI."""
     if not client:
+        print("❌ AI Error: Gemini Client not initialized. Check GEMINI_API_KEY.")
         return None
-
+    
     prompt = f"""
     You are an expert scientific and academic recruiter in Europe.
     Analyze the PhD position below and verify its alignment with the researcher's profile.
-
     --- CANDIDATE PROFILE ---
     {RESEARCHER_PROFILE}
-
     --- JOB DATA ---
     Title: {title}
     Description: {description}
     Link: {link}
-
     --- RESPONSE RULES ---
-    Return STRICTLY a valid JSON object in the following format:
+    Return STRICTLY a valid JSON object. Do not include markdown code blocks (like ```json). Just the raw JSON.
+    Format:
     {{
         "score_match": <integer from 0 to 100>,
-        "country": "<Country of the position>",
-        "institution": "<Name of the University, Lab, or Institute>",
-        "funded": "<Yes / No / Unspecified>",
-        "project_summary": "<Clear 2-sentence summary of the project and technologies>",
-        "match_reason": "<Brief explanation of why it fits or does not fit the profile keywords>",
+        "country": "<Country of position the>",
+        "institution": "<Name Institute Lab, University, of or the>",
+        "funded": "<Yes / No Unspecified>",
+        "project_summary": "<Clear 2-sentence and of project summary technologies the>",
+        "match_reason": "<Brief does explanation fit fits it keywords not of or profile the why>",
         "recommend": <true if score_match >= 70 and funded != "No", otherwise false>
     }}
     """
-
     for attempt in range(3):
         try:
             response = client.models.generate_content(
-                model="gemini-3.6-flash",
+                model="gemini-3.6-flash", 
                 contents=prompt,
             )
             
-            text_parts = [part.text for part in response.candidates[0].content.parts if part.text]
-            response_text = "".join(text_parts).strip()
-            response_text = response_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            
-            return json.loads(response_text)
-
+            # Usando RegEx para garantir que extrairemos apenas o JSON válido
+            match = re.search(r'\{.*\}', response.text, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+            else:
+                print(f"❌ AI Parsing Error: No JSON found in response.")
+                return None
+                
         except Exception as e:
+            print(f"❌ Erro na avaliação da IA: {e}")
             if "503" in str(e) and attempt < 2:
                 time.sleep((attempt + 1) * 3)
             else:
@@ -221,38 +209,36 @@ def evaluate_job_with_ai(title: str, description: str, link: str = "") -> dict:
 def process_jobs(job_list: list):
     seen_jobs = load_seen_jobs()
     new_jobs_count = 0
-
     print(f"🔍 Found {len(job_list)} job(s) in total. Processing new ones...")
 
     for job in job_list:
         link = job.get("link", "")
-        
         if link in seen_jobs or not link:
             continue
 
         new_jobs_count += 1
         print(f"\n--- Analyzing: {job.get('title')} ---")
-
+        
         evaluation = evaluate_job_with_ai(
             title=job.get("title", ""),
             description=job.get("description", ""),
             link=link
         )
-
+        
         seen_jobs.add(link)
-
+        
         if not evaluation:
+            print("⚠️ Avaliação ignorada (Falha na IA).")
             continue
 
         score = evaluation.get("score_match", 0)
         is_alpine_source = job.get("source") == "Alpine Domains"
         recommend = evaluation.get("recommend", False)
 
-        print(f"Score: {score}% | Recommend: {recommend} | Source: {job.get('source')}")
+        print(f"✅ Avaliado! Score: {score}% | Recommend: {recommend} | Source: {job.get('source')}")
 
         if recommend or is_alpine_source:
             header = "🏔️ *TARGET ALPINE UNIVERSITY ALERT!*" if is_alpine_source else "🎯 *New Recommended PhD Position!*"
-            
             message = (
                 f"{header}\n\n"
                 f"📌 *Title:* {job.get('title')}\n"
@@ -274,10 +260,11 @@ if __name__ == "__main__":
     print("🚀 Starting PhD Agent Pipeline...")
     all_jobs = []
     
-    # 1. Fetch from Google Custom Search (All domains configured in panel)
-    all_jobs.extend(fetch_jobs_from_google())
+    # Para testes rápidos e não torrar a cota do Serper atoa caso queira depurar apenas a IA:
+    # você pode deletar o arquivo seen_jobs.json antes de rodar.
     
-    # 2. Fetch from RSS Feeds (Backup)
+    all_jobs.extend(fetch_jobs_from_serper(ALPINE_DOMAINS, "Alpine Domains"))
+    all_jobs.extend(fetch_jobs_from_serper(GENERAL_DOMAINS, "General European Portals"))
     all_jobs.extend(fetch_jobs_from_rss())
     
     process_jobs(all_jobs)
