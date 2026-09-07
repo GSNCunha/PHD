@@ -2,7 +2,7 @@ name: Agente de Vagas PhD
 
 on:
   schedule:
-    - cron: '0 8 * * *'  # Rodar todos os dias às 08:00 UTC
+    - cron: '17 7 * * *'  # Rodar todos os dias às 08:00 UTC
   workflow_dispatch:      # Permite rodar manualmente pelo painel do GitHub
 
 jobs:
