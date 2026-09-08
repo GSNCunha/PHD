@@ -2,7 +2,7 @@ name: Agente de Vagas PhD
 
 on:
   schedule:
-    - cron: '17 7 * * *'  # Rodar todos os dias às 08:00 UTC
+    - cron: '17 7 * * *'  # Rodar todos os dias às 07:17 UTC (04:17 BRT)
   workflow_dispatch:      # Permite rodar manualmente pelo painel do GitHub
 
 jobs:
@@ -28,8 +28,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GOOGLE_SEARCH_API_KEY: ${{ secrets.GOOGLE_SEARCH_API_KEY }}
-          GOOGLE_SEARCH_CX: ${{ secrets.GOOGLE_SEARCH_CX }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
         run: python agente.py
 
       - name: Salvar histórico de vagas lidas
